@@ -808,7 +808,6 @@ public class AvroData {
             bytesVal =
             recordValue.get(ANYTHING_SCHEMA.getField(ANYTHING_SCHEMA_BYTES_FIELD).pos());
         if (bytesVal != null) {
-          log.error("BYTE VALUE");
           return toConnectData(Schema.BYTES_SCHEMA, bytesVal);
         }
 
@@ -906,7 +905,6 @@ public class AvroData {
           break;
 
         case BYTES:
-          log.error("AGAIN BYTES");
           if (value instanceof byte[]) {
             converted = ByteBuffer.wrap((byte[]) value);
           } else if (value instanceof ByteBuffer) {
