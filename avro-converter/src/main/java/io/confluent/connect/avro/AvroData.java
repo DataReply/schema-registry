@@ -40,6 +40,8 @@ import org.codehaus.jackson.JsonNode;
 import org.codehaus.jackson.node.ArrayNode;
 import org.codehaus.jackson.node.JsonNodeFactory;
 import org.codehaus.jackson.node.ObjectNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -58,6 +60,7 @@ import java.util.Set;
  * Utilities for converting between our runtime data format and Avro, and (de)serializing that data.
  */
 public class AvroData {
+  private static final Logger log = LoggerFactory.getLogger(AvroData.class);
   public static final String NAMESPACE = "io.confluent.connect.avro";
   // Avro does not permit empty schema names, which might be the ideal default since we also are
   // not permitted to simply omit the name. Instead, make it very clear where the default is
@@ -199,7 +202,6 @@ public class AvroData {
     TO_CONNECT_LOGICAL_CONVERTERS.put(Timestamp.LOGICAL_NAME, new LogicalTypeConverter() {
       @Override
       public Object convert(Schema schema, Object value) {
-        value = value == null ? new Long(0):value;
         if (!(value instanceof Long))
           throw new DataException("Invalid type for Timestamp, underlying representation should be int64 but was " + value.getClass());
         return Timestamp.toLogical(schema, (long) value);
@@ -295,13 +297,8 @@ public class AvroData {
         return null;
     }
 
-    boolean schemaOptional = schema != null ? schema.isOptional() : true;
-    if (!schemaOptional && logicalValue == null) {
-      throw new DataException("Found null value for non-optional schema");
-    }
+    validateSchemaValue(schema, logicalValue);
 
-    // Now it is safe to handle null values since we have validated that it is a valid value for the
-    // schema
     if (logicalValue == null) {
       // But if this is schemaless, we may not be able to return null directly
       if (schema == null && requireSchemalessContainerNull)
@@ -320,10 +317,7 @@ public class AvroData {
     }
 
     try {
-
-
       switch (schemaType) {
-
         case INT8: {
           Byte byteValue = (Byte) value; // Check for correct type
           Integer convertedByteValue = byteValue == null ? null : byteValue.intValue();
@@ -392,8 +386,9 @@ public class AvroData {
           // TODO most types don't need a new converted object since types pass through
           List<Object> converted = new ArrayList<>(list.size());
           Schema elementSchema = schema != null ? schema.valueSchema() : null;
-          org.apache.avro.Schema elementAvroSchema =
-              schema != null ? avroSchema.getElementType() : ANYTHING_SCHEMA;
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
+          org.apache.avro.Schema elementAvroSchema = 
+              schema != null ? underlyingAvroSchema.getElementType() : ANYTHING_SCHEMA;
           for (Object val : list) {
             converted.add(
                 fromConnectData(elementSchema, elementAvroSchema, val, false, true)
@@ -407,6 +402,7 @@ public class AvroData {
 
         case MAP: {
           Map<Object, Object> map = (Map<Object, Object>) value;
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
           if (schema != null &&
               schema.keySchema().type() == Schema.Type.STRING && !schema.keySchema().isOptional()) {
             // TODO most types don't need a new converted object since types pass through
@@ -414,7 +410,7 @@ public class AvroData {
             for (Map.Entry<Object, Object> entry : map.entrySet()) {
               // Key is a String, no conversion needed
               Object convertedValue = fromConnectData(schema.valueSchema(),
-                                                      avroSchema.getValueType(),
+                                                      underlyingAvroSchema.getValueType(),
                                                       entry.getValue(), false, true);
               converted.put((String)entry.getKey(), convertedValue);
             }
@@ -422,7 +418,7 @@ public class AvroData {
           } else {
             List<GenericRecord> converted = new ArrayList<>(map.size());
             org.apache.avro.Schema elementSchema =
-                schema != null ? avroSchema.getElementType() : ANYTHING_SCHEMA_MAP_ELEMENT;
+                schema != null ? underlyingAvroSchema.getElementType() : ANYTHING_SCHEMA_MAP_ELEMENT;
             org.apache.avro.Schema avroKeySchema = elementSchema.getField(KEY_FIELD).schema();
             org.apache.avro.Schema avroValueSchema = elementSchema.getField(VALUE_FIELD).schema();
             for (Map.Entry<Object, Object> entry : map.entrySet()) {
@@ -448,9 +444,10 @@ public class AvroData {
           Struct struct = (Struct) value;
           if (!struct.schema().equals(schema))
             throw new DataException("Mismatching struct schema");
-          GenericRecordBuilder convertedBuilder = new GenericRecordBuilder(avroSchema);
+          org.apache.avro.Schema underlyingAvroSchema = avroSchemaForUnderlyingTypeIfOptional(schema, avroSchema);
+          GenericRecordBuilder convertedBuilder = new GenericRecordBuilder(underlyingAvroSchema);
           for (Field field : schema.fields()) {
-            org.apache.avro.Schema fieldAvroSchema = avroSchema.getField(field.name()).schema();
+            org.apache.avro.Schema fieldAvroSchema = underlyingAvroSchema.getField(field.name()).schema();
             convertedBuilder.set(
                 field.name(),
                 fromConnectData(field.schema(), fieldAvroSchema, struct.get(field), false, true));
@@ -464,6 +461,33 @@ public class AvroData {
     } catch (ClassCastException e) {
       throw new DataException("Invalid type for " + schema.type() + ": " + value.getClass());
     }
+  }
+  
+  /**
+   * Connect optional fields are represented as a unions (null & type) in Avro
+   * Return the Avro schema of the actual type in the Union (instead of the union itself)
+   * @param schema
+   * @param avroSchema
+   * @return
+   */
+  private static org.apache.avro.Schema avroSchemaForUnderlyingTypeIfOptional(Schema schema, org.apache.avro.Schema avroSchema){
+    
+    if (schema != null && schema.isOptional()) {
+      if (avroSchema.getType() == org.apache.avro.Schema.Type.UNION) {
+        for (org.apache.avro.Schema typeSchema : avroSchema
+            .getTypes()) {
+          if (!typeSchema.getType().equals(
+              org.apache.avro.Schema.Type.NULL)) {
+              return typeSchema;
+          }
+        }
+      } else {
+        throw new DataException(
+            "An optinal schema should have an Avro Union type, not "
+                + schema.type());
+      }
+    }
+    return avroSchema;
   }
 
   private static Schema.Type schemaTypeForSchemalessJavaType(Object value) {
@@ -743,6 +767,12 @@ public class AvroData {
     return result;
   }
 
+  private static void validateSchemaValue(Schema schema, Object value) throws DataException{
+      if (value == null && schema != null && !schema.isOptional()) {
+        throw new DataException("Found null value for non-optional schema");
+      }
+  }
+  
   /**
    * Convert the given object, in Avro format, into an Connect data object.
    */
@@ -756,6 +786,10 @@ public class AvroData {
   }
 
   private Object toConnectData(Schema schema, Object value) {
+    validateSchemaValue(schema, value);
+    if (value == null) {
+      return null;
+    }  
     try {
       // If we're decoding schemaless data, we need to unwrap it into just the single value
       if (schema == null) {
@@ -773,8 +807,9 @@ public class AvroData {
         Object
             bytesVal =
             recordValue.get(ANYTHING_SCHEMA.getField(ANYTHING_SCHEMA_BYTES_FIELD).pos());
-        if (bytesVal != null)
+        if (bytesVal != null) {
           return toConnectData(Schema.BYTES_SCHEMA, bytesVal);
+        }
 
         Object
             dblVal =
@@ -857,7 +892,6 @@ public class AvroData {
           break;
 
         case STRING:
-          value = value == null ? new String(""):value;
           if (value instanceof String) {
             converted = value;
           } else if (value instanceof CharSequence ||
@@ -871,7 +905,6 @@ public class AvroData {
           break;
 
         case BYTES:
-		      value = value == null ? new byte[]{0}:value;
           if (value instanceof byte[]) {
             converted = ByteBuffer.wrap((byte[]) value);
           } else if (value instanceof ByteBuffer) {
@@ -885,15 +918,11 @@ public class AvroData {
         case ARRAY: {
           Schema valueSchema = schema.valueSchema();
           Collection<Object> original = (Collection<Object>) value;
-          if (original == null) {
-            converted = null;
-          } else {
-            List<Object> result = new ArrayList<>(original.size());
-            for (Object elem : original) {
-              result.add(toConnectData(valueSchema, elem));
-            }
-            converted = result;
+          List<Object> result = new ArrayList<>(original.size());
+          for (Object elem : original) {
+            result.add(toConnectData(valueSchema, elem));
           }
+          converted = result;
           break;
         }
 
@@ -904,32 +933,24 @@ public class AvroData {
               .isOptional()) {
             // String keys
             Map<CharSequence, Object> original = (Map<CharSequence, Object>) value;
-            if (original == null) {
-              converted = null;
-            } else {
-              Map<CharSequence, Object> result = new HashMap<>(original.size());
-              for (Map.Entry<CharSequence, Object> entry : original.entrySet()) {
-                result.put(entry.getKey().toString(),
-                           toConnectData(valueSchema, entry.getValue()));
-              }
-              converted = result;
+            Map<CharSequence, Object> result = new HashMap<>(original.size());
+            for (Map.Entry<CharSequence, Object> entry : original.entrySet()) {
+              result.put(entry.getKey().toString(),
+                         toConnectData(valueSchema, entry.getValue()));
             }
+            converted = result;
           } else {
             // Arbitrary keys
             List<IndexedRecord> original = (List<IndexedRecord>) value;
-            if (original == null) {
-              converted = null;
-            } else {
-              Map<Object, Object> result = new HashMap<>(original.size());
-              for (IndexedRecord entry : original) {
-                int avroKeyFieldIndex = entry.getSchema().getField(KEY_FIELD).pos();
-                int avroValueFieldIndex = entry.getSchema().getField(VALUE_FIELD).pos();
-                Object convertedKey = toConnectData(keySchema, entry.get(avroKeyFieldIndex));
-                Object convertedValue = toConnectData(valueSchema, entry.get(avroValueFieldIndex));
-                result.put(convertedKey, convertedValue);
-              }
-              converted = result;
+            Map<Object, Object> result = new HashMap<>(original.size());
+            for (IndexedRecord entry : original) {
+              int avroKeyFieldIndex = entry.getSchema().getField(KEY_FIELD).pos();
+              int avroValueFieldIndex = entry.getSchema().getField(VALUE_FIELD).pos();
+              Object convertedKey = toConnectData(keySchema, entry.get(avroKeyFieldIndex));
+              Object convertedValue = toConnectData(valueSchema, entry.get(avroValueFieldIndex));
+              result.put(convertedKey, convertedValue);
             }
+            converted = result;
           }
           break;
         }
@@ -958,18 +979,14 @@ public class AvroData {
             }
           } else {
             IndexedRecord original = (IndexedRecord) value;
-            if (original == null) {
-              converted = null;
-            } else {
-              Struct result = new Struct(schema);
-              for (Field field : schema.fields()) {
-                int avroFieldIndex = original.getSchema().getField(field.name()).pos();
-                Object convertedFieldValue
-                    = toConnectData(field.schema(), original.get(avroFieldIndex));
-                result.put(field, convertedFieldValue);
-              }
-              converted = result;
+            Struct result = new Struct(schema);
+            for (Field field : schema.fields()) {
+              int avroFieldIndex = original.getSchema().getField(field.name()).pos();
+              Object convertedFieldValue
+                  = toConnectData(field.schema(), original.get(avroFieldIndex));
+              result.put(field, convertedFieldValue);
             }
+            converted = result;
           }
           break;
         }
